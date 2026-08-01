@@ -113,10 +113,18 @@ import logging
 import time
 from typing import Callable, Dict, Optional, List, Any
 
+import aiohttp
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import config
+
+# Deriv's Options trading API (REST for account/OTP setup, WS for trading).
+# Per developers.deriv.com/docs/options/: live trading and account operations
+# go through this OTP-based flow. The old wss://ws.derivws.com/websockets/v3
+# + {"authorize": token} pattern (see _authorize() below) still answers
+# read-only calls but is documented as the legacy path.
+_OPTIONS_API_BASE = "https://api.derivws.com/trading/v1/options"
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +199,107 @@ class DerivClient:
         assert "PUT" == ("CALL" if "SHORT" == "LONG" else "PUT"), (
             "FATAL: SHORT→PUT mapping is broken")
 
+    # ─── Options API: REST account lookup + OTP WebSocket URL ─────────────────
+
+    async def _fetch_otp_ws_url(self) -> str:
+        """
+        Two-step REST flow per Deriv's Options trading API:
+          1. GET  /accounts             -> list this user's Options accounts
+          2. POST /accounts/{id}/otp    -> one-time WebSocket URL (OTP embedded)
+
+        The account (real vs demo) is picked via config.DERIV_ACCOUNT_MODE.
+        Returns the ready-to-connect wss:// URL. The OTP is valid for 120
+        seconds and single-use, so this must be called fresh on every
+        (re)connect attempt — never cache the URL.
+        """
+        app_id = config.DERIV_APP_ID
+        token  = config.DERIV_API_TOKEN
+        mode   = getattr(config, "DERIV_ACCOUNT_MODE", "demo").strip().lower()
+
+        if not app_id:
+            raise ValueError("DERIV_APP_ID is not set.")
+        if not token:
+            raise ValueError("DERIV_API_TOKEN is not set.")
+        if mode not in ("real", "demo"):
+            raise ValueError(
+                f"DERIV_ACCOUNT_MODE must be 'real' or 'demo', got {mode!r}."
+            )
+
+        headers = {
+            "Deriv-App-ID": app_id,
+            "Authorization": f"Bearer {token}",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            # Step 1 — list accounts
+            async with session.get(
+                f"{_OPTIONS_API_BASE}/accounts", headers=headers
+            ) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"Failed to list Options accounts: HTTP {resp.status} {body}"
+                    )
+
+            accounts = body.get("data", body) if isinstance(body, dict) else body
+            if not accounts:
+                raise RuntimeError(f"No Options accounts returned: {body}")
+
+            chosen = None
+            for acct in accounts:
+                acct_type = (
+                    acct.get("type")
+                    or acct.get("account_type")
+                    or ("demo" if acct.get("is_virtual") else "real")
+                    or ""
+                )
+                if str(acct_type).lower() == mode:
+                    chosen = acct
+                    break
+
+            if chosen is None:
+                # Field names in the response aren't confirmed against docs yet —
+                # fall back to the first account but log loudly so this is visible
+                # rather than silently trading on the wrong one.
+                logger.warning(
+                    f"Could not match an Options account to mode={mode!r}; "
+                    f"falling back to first account returned. Raw accounts: {accounts}"
+                )
+                chosen = accounts[0]
+
+            account_id = (
+                chosen.get("accountId") or chosen.get("account_id") or chosen.get("id")
+            )
+            if not account_id:
+                raise RuntimeError(
+                    f"Could not find an accountId field in account data: {chosen}"
+                )
+
+            logger.info(f"Using Options accountId={account_id} (mode={mode})")
+
+            # Step 2 — request the OTP-embedded WebSocket URL
+            async with session.post(
+                f"{_OPTIONS_API_BASE}/accounts/{account_id}/otp", headers=headers
+            ) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"Failed to get OTP WebSocket URL: HTTP {resp.status} {body}"
+                    )
+
+            ws_url = (body.get("data") or {}).get("url") or body.get("url")
+            if not ws_url:
+                raise RuntimeError(f"OTP response missing 'url' field: {body}")
+
+            return ws_url
+
+    @staticmethod
+    def _mask_otp(ws_url: str) -> str:
+        if "otp=" in ws_url:
+            base, _, _ = ws_url.partition("otp=")
+            return f"{base}otp=***OTP***"
+        return ws_url
+
     # ─── Connection ───────────────────────────────────────────────────────────
 
     async def connect(self):
@@ -215,8 +324,8 @@ class DerivClient:
 
         while True:
             try:
-                ws_url = config.DERIV_WS_URL
-                logger.info(f"Connecting to {ws_url} …")
+                ws_url = await self._fetch_otp_ws_url()
+                logger.info(f"Connecting to {self._mask_otp(ws_url)} …")
                 async with websockets.connect(
                     ws_url,
                     ping_interval=20,
@@ -228,11 +337,10 @@ class DerivClient:
                     attempt         = 0          # reset on successful connection
                     logger.info("WebSocket connected ✓")
 
-                    # Standard Deriv auth: send {"authorize": <token>} over this
-                    # same WS connection and wait for the response. Sets
-                    # self._authorized / self._ready / self._balance on success,
-                    # raises RuntimeError on an API error (caught below).
-                    await self._authorize()
+                    # The OTP embedded in ws_url already authenticated this
+                    # connection — no separate authorize message needed/accepted.
+                    self._authorized = True
+                    self._ready.set()
                     dispatch_task = asyncio.ensure_future(self._dispatch_loop())
                     try:
                         await self._subscribe_balance()
@@ -1515,6 +1623,15 @@ class DerivClient:
         returns [] and logs CONTRACTS_FOR FAILED — never raises, so a caller
         looping over many symbols can treat an empty list as "skip and
         continue" without wrapping every call in its own try/except.
+
+        CAVEAT: Deriv's own Legacy-vs-New API comparison notes contracts_for
+        field names were simplified in the new Options API (currency param
+        removed, some market-data fields dropped). The parsing below assumes
+        the legacy shape (contracts_for.available[].contract_type /
+        multiplier_range / barrier_category) — if a live audit run comes back
+        with empty contract_types across the board despite no errors, that's
+        the first thing to check against real output, not assume symbols
+        support nothing.
         """
         await self._ready.wait()
         try:
