@@ -1604,8 +1604,7 @@ class DerivClient:
 
     async def contracts_for(
         self,
-        symbol:   str,
-        currency: str = "USD",
+        symbol: str,
     ) -> List[dict]:
         """
         Read-only lookup of every contract type Deriv currently offers for
@@ -1624,22 +1623,15 @@ class DerivClient:
         looping over many symbols can treat an empty list as "skip and
         continue" without wrapping every call in its own try/except.
 
-        CAVEAT: Deriv's own Legacy-vs-New API comparison notes contracts_for
-        field names were simplified in the new Options API (currency param
-        removed, some market-data fields dropped). The parsing below assumes
-        the legacy shape (contracts_for.available[].contract_type /
-        multiplier_range / barrier_category) — if a live audit run comes back
-        with empty contract_types across the board despite no errors, that's
-        the first thing to check against real output, not assume symbols
-        support nothing.
+        NOTE: no currency param — confirmed live against the Options API that
+        it's rejected outright (InputValidationFailed: "Properties not
+        allowed: currency"), matching Deriv's Legacy-vs-New comparison notes
+        that currency was dropped from this call in the new API.
         """
         await self._ready.wait()
         try:
             resp = await self._send(
-                {
-                    "contracts_for": symbol,
-                    "currency":      currency,
-                },
+                {"contracts_for": symbol},
                 timeout=20,
             )
             return resp.get("contracts_for", {}).get("available", [])
